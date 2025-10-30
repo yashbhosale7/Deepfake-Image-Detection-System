@@ -1,0 +1,412 @@
+from flask import Flask, request, render_template_string, redirect, url_for, send_from_directory, jsonify
+from pathlib import Path
+import tempfile
+import os
+import shutil
+import traceback
+
+# Import prediction helper from infer.py
+from infer import build_transform, build_model, get_device, predict_one, pick_checkpoint
+
+app = Flask(__name__)
+
+ROOT = Path(__file__).resolve().parents[1]
+UPLOAD_DIR = ROOT / "data" / "infer" / "web_uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+HTML_PAGE = """
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Deepfake Detector</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <style>
+            body { padding-top: 40px; background:#f7fafc; }
+            .card { box-shadow: 0 6px 18px rgba(0,0,0,0.06); }
+            .result-badge { font-size: 1rem; }
+            .preview-img { max-width: 100%; height: auto; border-radius: 6px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="row justify-content-center">
+                <div class="col-md-8">
+                    <div class="card p-4">
+                        <h3 class="mb-3">Deepfake Detector</h3>
+                        <p class="text-muted">Upload an image and let the model evaluate whether it's real or fake.</p>
+
+                        <div class="mb-3">
+                            <input class="form-control" type="file" id="fileInput" accept="image/*">
+                        </div>
+
+                        <div class="d-flex gap-2 mb-3">
+                            <button id="uploadBtn" class="btn btn-primary">Upload & Predict</button>
+                            <button id="clearBtn" class="btn btn-outline-secondary">Clear</button>
+                        </div>
+
+                        <div id="feedback" class="mb-3"></div>
+
+                        <div id="resultCard" class="mt-3" style="display:none">
+                            <div class="card p-3">
+                                <div class="row">
+                                    <div class="col-md-5">
+                                        <img id="preview" class="preview-img" src="" alt="preview">
+                                    </div>
+                                    <div class="col-md-7">
+                                        <h5 id="labelText"></h5>
+                                        <p><strong>Confidence:</strong> <span id="confText"></span></p>
+                                        <p><strong>p_real:</strong> <span id="prealText"></span></p>
+                                        <p><strong>p_fake:</strong> <span id="pfakeText"></span></p>
+                                        <p><strong>ELA:</strong> <span id="elaText"></span></p>
+                                        <p><strong>FFT ratio:</strong> <span id="fftText"></span></p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="mt-3 text-muted"><small>Model loaded on demand. Check server logs for device & checkpoint used.</small></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+        <script>
+            const fileInput = document.getElementById('fileInput');
+            const uploadBtn = document.getElementById('uploadBtn');
+            const clearBtn = document.getElementById('clearBtn');
+            const feedback = document.getElementById('feedback');
+            const resultCard = document.getElementById('resultCard');
+
+            function reset() {
+                fileInput.value = '';
+                resultCard.style.display = 'none';
+                feedback.innerHTML = '';
+                document.getElementById('preview').src = '';
+            }
+
+            clearBtn.addEventListener('click', (e) => { e.preventDefault(); reset(); });
+
+            uploadBtn.addEventListener('click', async (e) => {
+                e.preventDefault();
+                feedback.innerHTML = '';
+                if (!fileInput.files || fileInput.files.length === 0) {
+                    feedback.innerHTML = '<div class="alert alert-warning">Please pick an image first.</div>';
+                    return;
+                }
+
+                const file = fileInput.files[0];
+                const form = new FormData();
+                form.append('file', file);
+
+                feedback.innerHTML = '<div class="spinner-border text-primary" role="status"><span class="visually-hidden">Loading...</span></div> Uploading...';
+                uploadBtn.disabled = true;
+
+                try {
+                    const res = await fetch('/api/predict', { method: 'POST', body: form });
+                    if (!res.ok) {
+                        const err = await res.json().catch(() => ({}));
+                        feedback.innerHTML = `<div class="alert alert-danger">Error: ${err.error || res.statusText}</div>`;
+                        return;
+                    }
+                    const data = await res.json();
+
+                    // show result
+                    resultCard.style.display = 'block';
+                    document.getElementById('preview').src = URL.createObjectURL(file);
+                    document.getElementById('labelText').innerText = data.label;
+                    document.getElementById('confText').innerText = (data.confidence || 0).toFixed(3);
+                    document.getElementById('prealText').innerText = (data.p_real || 0).toFixed(3);
+                    document.getElementById('pfakeText').innerText = (data.p_fake || 0).toFixed(3);
+                    document.getElementById('elaText').innerText = (data.ela || 0).toFixed(3);
+                    document.getElementById('fftText').innerText = (data.fft_ratio || 0).toFixed(3);
+                    feedback.innerHTML = '<div class="alert alert-success">Prediction ready</div>';
+                } catch (err) {
+                    feedback.innerHTML = `<div class="alert alert-danger">${err.message}</div>`;
+                } finally {
+                    uploadBtn.disabled = false;
+                }
+            });
+        </script>
+    </body>
+</html>
+"""
+def load_model(checkpoint: str = None, model_name: str = "resnet50"):
+    device = get_device()
+    ckpt = checkpoint or pick_checkpoint()
+    tfm = build_transform(model_name)
+    model = build_model(model_name, num_classes=2, ckpt_path=ckpt, device=device)
+    return model, tfm, device
+
+
+# Load model lazily on first request
+_MODEL = None
+_TFM = None
+_DEVICE = None
+
+
+@app.route('/', methods=['GET', 'POST'])
+def upload():
+    global _MODEL, _TFM, _DEVICE
+    result = None
+    if request.method == 'POST':
+        if 'file' not in request.files:
+            return redirect(request.url)
+        file = request.files['file']
+        if file.filename == '':
+            return redirect(request.url)
+
+        # save to uploads dir
+        tmp_path = UPLOAD_DIR / file.filename
+        file.save(tmp_path)
+
+        try:
+            if _MODEL is None:
+                _MODEL, _TFM, _DEVICE = load_model()
+
+            res = predict_one(_MODEL, _TFM, _DEVICE, tmp_path)
+            # attach filename for display
+            res['file_name'] = tmp_path.name
+            result = type('R', (), res)
+        except Exception as e:
+            traceback.print_exc()
+            result = type('R', (), {'label': 'error', 'confidence': 0.0, 'p_real': 0.0, 'p_fake': 0.0, 'ela':0.0, 'fft_ratio':0.0, 'file_name': tmp_path.name})
+
+    return render_template_string(HTML_PAGE, result=result)
+
+
+@app.route('/uploads/<path:filename>')
+def uploaded_file(filename):
+    return send_from_directory(str(UPLOAD_DIR), filename)
+
+
+@app.route('/api/predict', methods=['POST'])
+def api_predict():
+    """API endpoint: accepts a file under 'file' and returns JSON with prediction."""
+    global _MODEL, _TFM, _DEVICE
+    if 'file' not in request.files:
+        return jsonify({'error': 'no file provided'}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'empty filename'}), 400
+
+    tmp_dir = tempfile.mkdtemp(prefix='df_ui_')
+    try:
+        tmp_path = Path(tmp_dir) / file.filename
+        file.save(tmp_path)
+        if _MODEL is None:
+            _MODEL, _TFM, _DEVICE = load_model()
+        res = predict_one(_MODEL, _TFM, _DEVICE, tmp_path)
+        # include filename so UI can preview — but don't expose full path
+        res['file_name'] = file.filename
+        return jsonify(res)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            shutil.rmtree(tmp_dir)
+        except Exception:
+            pass
+
+
+if __name__ == '__main__':
+    # Run a development server
+    app.run(host='0.0.0.0', port=5001, debug=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# scripts/infer.py (JSON-safe xD)
+
+import argparse 
+from pathlib import Path
+import os, json
+import numpy as np
+from io import BytesIO
+import torch
+import timm
+from torchvision import transforms
+from PIL import Image
+
+# ---------------- device ----------------
+def get_device():
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+# --------------- paths ------------------
+ROOT = Path(__file__).resolve().parents[1]
+CKPT_DIR = ROOT / "checkpoints"
+SINGLE_DIR = ROOT / "data" / "infer" / "single"
+BATCH_DIR  = ROOT / "data" / "infer" / "batch"
+
+IMG_EXTS = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp")
+
+def list_images(folder: Path):
+    return [p for ext in IMG_EXTS for p in folder.glob(ext)]
+
+def newest_image(folder: Path):
+    files = list_images(folder)
+    if not files:
+        raise SystemExit(f"No images found in {folder}")
+    return max(files, key=lambda p: p.stat().st_mtime)
+
+def pick_checkpoint():
+    for name in ("best.pt", "resnet50_best.pth", "best.pth", "model_best.pt"):
+        p = CKPT_DIR / name
+        if p.exists():
+            return str(p)
+    raise SystemExit(f"No checkpoint found in {CKPT_DIR}")
+
+# --------------- model ------------------
+def build_model(model_name: str, num_classes: int, ckpt_path: str, device):
+    model = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
+    state = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    model.load_state_dict(state)
+    model.to(device).eval()
+    return model
+
+def build_transform(model_name: str):
+    mean, std = (0.485,0.456,0.406), (0.229,0.224,0.225)
+    size = 224  # keep 224 for consistency
+    return transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+
+# ----------- simple forensic cues -----------
+def _fft_ratio(img_pil: Image.Image) -> float:
+    g = np.asarray(img_pil.convert("L"), dtype=np.float32)
+    f = np.fft.fftshift(np.fft.fft2(g))
+    mag = np.log1p(np.abs(f))
+    h, w = mag.shape
+    cy, cx = h//2, w//2
+    r = max(2, min(cy, cx)//6)
+    center = float(mag[cy-r:cy+r, cx-r:cx+r].sum())
+    total  = float(mag.sum()) + 1e-6
+    return float(1.0 - (center/total))
+
+def _ela_score(img_pil: Image.Image, q: int = 90) -> float:
+    buf = BytesIO()
+    img_pil.save(buf, format="JPEG", quality=q, optimize=True)
+    comp = Image.open(BytesIO(buf.getvalue())).convert("RGB")
+    a = np.asarray(img_pil, dtype=np.int16)
+    b = np.asarray(comp,   dtype=np.int16)
+    diff = np.abs(a - b)
+    return float(diff.mean())
+
+# --------------- predict ----------------
+CLASSES = ["fake", "real"]
+
+def predict_one(model, tfm, device, path: Path, real_gate: float = 0.85):
+    img = Image.open(path).convert("RGB")
+
+    # network prob
+    x = tfm(img).unsqueeze(0).to(device)
+    with torch.no_grad():
+        probs = torch.softmax(model(x), dim=1)[0].cpu()
+    p_fake = float(probs[0].item())
+    p_real = float(probs[1].item())
+
+    base_label = "real" if p_real >= 0.5 else "fake"
+    base_conf  = p_real if base_label == "real" else p_fake
+
+    # heuristic second opinion
+    ela = float(_ela_score(img))
+    fft = float(_fft_ratio(img))
+    suspect = (base_label == "real" and p_real < real_gate) or (ela > 4.0) or (fft > 0.68)
+
+    final_label = "suspect_fake" if suspect and base_label == "real" else base_label
+    final_conf  = float(base_conf)
+
+    return {
+        "file": str(path),
+        "label": final_label,
+        "confidence": final_conf,
+        "p_real": float(p_real),
+        "p_fake": float(p_fake),
+        "ela": float(ela),
+        "fft_ratio": float(fft)
+    }
+
+# --------------- main -------------------
+def main(args):
+    # defaults (no args needed)
+    image_path = Path(args.image) if args.image else None
+    folder_path = Path(args.folder) if args.folder else None
+    ckpt_path = args.checkpoint or pick_checkpoint()
+    model_name = args.model or "resnet50"
+
+    # auto mode: prefer batch if images exist there; else newest in single
+    if not image_path and not folder_path:
+        batch_imgs = list_images(BATCH_DIR)
+        if batch_imgs:
+            folder_path = BATCH_DIR
+        else:
+            image_path = newest_image(SINGLE_DIR)
+
+    device = get_device()
+    print(f"Using device: {device}")
+    print(f"Using checkpoint: {ckpt_path}")
+    print(f"Using model: {model_name}")
+
+    tfm = build_transform(model_name)
+    model = build_model(model_name, num_classes=len(CLASSES), ckpt_path=ckpt_path, device=device)
+
+    results = []
+    if folder_path:
+        imgs = list_images(folder_path)
+        if not imgs:
+            raise SystemExit(f"No images found in {folder_path}")
+        print(f"Found {len(imgs)} images in {folder_path}")
+        for p in imgs:
+            results.append(predict_one(model, tfm, device, p))
+    else:
+        print(f"Using image: {image_path}")
+        results.append(predict_one(model, tfm, device, image_path))
+
+    # print results
+    for r in results:
+        print(
+            f"Prediction: {r['label']} ({r['confidence']*100:.1f}%)  "
+            f"p_real={r['p_real']*100:.1f}%  p_fake={r['p_fake']*100:.1f}%  "
+            f"ela={r['ela']:.2f} fft={r['fft_ratio']:.2f}  -  {Path(r['file']).name}"
+        )
+
+    # JSON summary (now JSON-serializable)
+    print(json.dumps({"results": results}, indent=2))
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--image", default=None, help="path to a single image (optional)")
+    ap.add_argument("--folder", default=None, help="path to a folder of images (optional)")
+    ap.add_argument("--checkpoint", default=None, help="override checkpoint path (optional)")
+    ap.add_argument("--model", default="resnet50", help="timm model name")
+    args = ap.parse_args()
+    main(args)

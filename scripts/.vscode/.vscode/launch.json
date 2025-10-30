@@ -1,0 +1,93 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Train 5k (MPS-safe)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/train.py",
+      "args": [
+        "--data-dir", "${workspaceFolder}/../data/subsets/5k",
+        "--checkpoints", "${workspaceFolder}/../checkpoints",
+        "--model", "resnet50",
+        "--epochs", "12",
+        "--batch-size", "16",
+        "--lr", "3e-4"
+      ],
+      "env": {
+        "PYTORCH_ENABLE_MPS_FALLBACK": "1",
+        "OMP_NUM_THREADS": "2"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Train 10k (MPS-safe)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/train.py",
+      "args": [
+        "--data-dir", "${workspaceFolder}/../data/subsets/10k",
+        "--checkpoints", "${workspaceFolder}/../checkpoints",
+        "--model", "resnet50",
+        "--epochs", "12",
+        "--batch-size", "16",
+        "--lr", "3e-4"
+      ],
+      "env": {
+        "PYTORCH_ENABLE_MPS_FALLBACK": "1",
+        "OMP_NUM_THREADS": "2"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Train 10k (EffNetV2-B0 fast)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/train.py",
+      "args": [
+        "--data-dir", "${workspaceFolder}/../data/subsets/10k",
+        "--checkpoints", "${workspaceFolder}/../checkpoints",
+        "--model", "tf_efficientnetv2_b0.in1k",
+        "--epochs", "12",
+        "--batch-size", "16",
+        "--lr", "3e-4"
+      ],
+      "env": {
+        "PYTORCH_ENABLE_MPS_FALLBACK": "1",
+        "OMP_NUM_THREADS": "2"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Evaluate Model (10k)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/eval.py",
+      "args": [
+        "--data-dir", "${workspaceFolder}/../data/subsets/10k",
+        "--checkpoint", "${workspaceFolder}/../checkpoints/best.pt"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Infer (auto-pick newest or batch)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/infer.py",
+      "args": [],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Predict Folder (batch → outputs/preds.csv)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/predict_folder.py",
+      "args": [
+        "--checkpoint", "${workspaceFolder}/../checkpoints/best.pt",
+        "--folder", "${workspaceFolder}/../data/infer/batch",
+        "--out", "${workspaceFolder}/../outputs/preds.csv"
+      ],
+      "console": "integratedTerminal"
+    }
+  ]
+}
